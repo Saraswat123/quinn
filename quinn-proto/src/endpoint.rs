@@ -24,7 +24,7 @@ use crate::{
     coding::BufMutExt,
     config::{ClientConfig, EndpointConfig, ServerConfig},
     connection::{Connection, ConnectionError, SideArgs},
-    crypto::{self, Keys, UnsupportedVersion},
+    crypto::{self, HmacKey, Keys, UnsupportedVersion},
     frame,
     packet::{
         FixedLengthConnectionIdParser, Header, InitialHeader, InitialPacket, PacketDecodeError,
@@ -56,6 +56,15 @@ pub struct Endpoint {
     /// Buffered Initial and 0-RTT messages for pending incoming connections
     incoming_buffers: Slab<IncomingBuffer>,
     all_incoming_buffers_total_bytes: u64,
+    /// Key currently used to compute stateless reset tokens.
+    ///
+    /// Starts as `config.reset_key` and is periodically replaced in place when
+    /// `config.reset_key_rotation` is set, so `config.reset_key` itself is never mutated and
+    /// remains available as the value the endpoint was constructed with.
+    current_reset_key: Arc<dyn HmacKey>,
+    /// Connections issued or accepted since `current_reset_key` was last replaced. Only
+    /// meaningful when `config.reset_key_rotation` is set.
+    connections_since_reset_key_rotation: u64,
 }
 
 impl Endpoint {
@@ -80,12 +89,28 @@ impl Endpoint {
             index: ConnectionIndex::default(),
             connections: Slab::new(),
             local_cid_generator: (config.connection_id_generator_factory.as_ref())(),
+            current_reset_key: config.reset_key.clone(),
             config,
             server_config,
             allow_mtud,
             last_stateless_reset: None,
             incoming_buffers: Slab::new(),
             all_incoming_buffers_total_bytes: 0,
+            connections_since_reset_key_rotation: 0,
+        }
+    }
+
+    /// Record that a connection was just issued or accepted, rotating `current_reset_key` if
+    /// `config.reset_key_rotation` is set and enough connections have passed since the last
+    /// rotation.
+    fn note_new_connection(&mut self) {
+        let Some(rotation) = &self.config.reset_key_rotation else {
+            return;
+        };
+        self.connections_since_reset_key_rotation += 1;
+        if self.connections_since_reset_key_rotation >= rotation.connections.get() {
+            self.current_reset_key = (rotation.new_key)();
+            self.connections_since_reset_key_rotation = 0;
         }
     }
 
@@ -317,7 +342,7 @@ impl Endpoint {
         buf.resize(padding_len, 0);
         self.rng.fill_bytes(&mut buf[0..padding_len]);
         buf[0] = 0b0100_0000 | (buf[0] >> 2);
-        buf.extend_from_slice(&ResetToken::new(&*self.config.reset_key, dst_cid));
+        buf.extend_from_slice(&ResetToken::new(&*self.current_reset_key, dst_cid));
 
         debug_assert!(buf.len() < inciting_dgram_len);
 
@@ -402,7 +427,7 @@ impl Endpoint {
             ids.push(IssuedCid {
                 sequence,
                 id,
-                reset_token: ResetToken::new(&*self.config.reset_key, id),
+                reset_token: ResetToken::new(&*self.current_reset_key, id),
             });
         }
         ConnectionEvent(ConnectionEventInner::NewIdentifiers(ids, now))
@@ -627,7 +652,7 @@ impl Endpoint {
             Some(&server_config),
             &mut self.rng,
         );
-        params.stateless_reset_token = Some(ResetToken::new(&*self.config.reset_key, loc_cid));
+        params.stateless_reset_token = Some(ResetToken::new(&*self.current_reset_key, loc_cid));
         params.original_dst_cid = Some(incoming.token.orig_dst_cid);
         params.retry_src_cid = incoming.token.retry_src_cid;
         let mut pref_addr_cid = None;
@@ -638,7 +663,7 @@ impl Endpoint {
                 address_v4: server_config.preferred_address_v4,
                 address_v6: server_config.preferred_address_v6,
                 connection_id: cid,
-                stateless_reset_token: ResetToken::new(&*self.config.reset_key, cid),
+                stateless_reset_token: ResetToken::new(&*self.current_reset_key, cid),
             });
         }
 
@@ -877,6 +902,7 @@ impl Endpoint {
         addresses: FourTuple,
         side: Side,
     ) {
+        self.note_new_connection();
         let mut cids_issued = 0;
         let mut loc_cids = FxHashMap::default();
 

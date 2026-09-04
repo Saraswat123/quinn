@@ -1,7 +1,7 @@
 use std::{
     fmt,
     net::{SocketAddrV4, SocketAddrV6},
-    num::TryFromIntError,
+    num::{NonZeroU64, TryFromIntError},
     sync::Arc,
 };
 
@@ -48,6 +48,16 @@ pub struct EndpointConfig {
     pub(crate) min_reset_interval: Duration,
     /// Optional seed to be used internally for random number generation
     pub(crate) rng_seed: Option<[u8; 32]>,
+    /// Automatic `reset_key` rotation, if enabled
+    pub(crate) reset_key_rotation: Option<ResetKeyRotation>,
+}
+
+/// Configuration for automatic `reset_key` rotation, set via
+/// [`EndpointConfig::rotate_reset_key_every`]
+#[derive(Clone)]
+pub(crate) struct ResetKeyRotation {
+    pub(crate) connections: NonZeroU64,
+    pub(crate) new_key: Arc<dyn Fn() -> Arc<dyn HmacKey> + Send + Sync>,
 }
 
 impl EndpointConfig {
@@ -63,6 +73,7 @@ impl EndpointConfig {
             grease_quic_bit: true,
             min_reset_interval: Duration::from_millis(20),
             rng_seed: None,
+            reset_key_rotation: None,
         }
     }
 
@@ -86,6 +97,44 @@ impl EndpointConfig {
     /// communicating with a previous instance of this endpoint.
     pub fn reset_key(&mut self, key: Arc<dyn HmacKey>) -> &mut Self {
         self.reset_key = key;
+        self
+    }
+
+    /// Periodically replace the key used to compute stateless reset tokens
+    ///
+    /// Every stateless reset token an `Endpoint` hands out is `sign(reset_key, cid)`. If a
+    /// connection ID is ever reused across two unrelated connections — extremely unlikely for a
+    /// single connection ID generator, but not impossible over an endpoint's lifetime, especially
+    /// for CID generators with a small ID space — both connections get an identical token, and a
+    /// stale token observed or retained from the first connection would validly reset the second.
+    /// Rotating `reset_key` bounds this: once the key has changed, a reused connection ID produces
+    /// a different token than it did before, so a token from a since-rotated key can no longer
+    /// reset a connection ID that happens to be reused after the rotation.
+    ///
+    /// `new_key` is called to produce each replacement key; it must be able to produce arbitrarily
+    /// many suitably random keys over the endpoint's lifetime, e.g. by reading fresh entropy each
+    /// call, not by fixed data.
+    ///
+    /// Disabled by default: `reset_key` never changes automatically unless this is called. Do not
+    /// enable this if you rely on a fixed `reset_key` remaining reproducible for the endpoint's
+    /// entire lifetime, e.g. to let other endpoint instances that share `reset_key` also compute
+    /// valid resets for this endpoint's connections.
+    ///
+    /// Rotating an in-use key is not free of cost: a legitimate stateless reset for a connection
+    /// whose ID was issued under an already-rotated-past key will no longer be recognized by that
+    /// connection's peer. This is not a correctness issue — a stateless reset is a best-effort
+    /// optimization, never a required part of the protocol — but it means an idle or otherwise
+    /// disused connection may take longer to clean up on the peer's side than it would without
+    /// rotation. Choose `connections` accordingly for your workload.
+    pub fn rotate_reset_key_every(
+        &mut self,
+        connections: NonZeroU64,
+        new_key: Arc<dyn Fn() -> Arc<dyn HmacKey> + Send + Sync>,
+    ) -> &mut Self {
+        self.reset_key_rotation = Some(ResetKeyRotation {
+            connections,
+            new_key,
+        });
         self
     }
 
@@ -165,6 +214,7 @@ impl fmt::Debug for EndpointConfig {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt.debug_struct("EndpointConfig")
             // reset_key not debug
+            // reset_key_rotation not debug (contains a closure)
             .field("max_udp_payload_size", &self.max_udp_payload_size)
             // cid_generator_factory not debug
             .field("supported_versions", &self.supported_versions)

@@ -423,6 +423,194 @@ fn stateless_reset_limit() {
     assert!(matches!(event, Some(DatagramEvent::Response(_))));
 }
 
+/// Rotating `reset_key` changes the token an endpoint computes for the same connection ID,
+/// bounding the impact of a connection ID that happens to be reused across two unrelated
+/// connections: a stale token from before the rotation no longer matches the token issued after.
+#[test]
+fn reset_key_rotation_changes_token_for_same_cid() {
+    let _guard = subscribe();
+    let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42);
+
+    let mut key_material = vec![0; 64];
+    let mut rng = rand::rng();
+    rng.fill_bytes(&mut key_material);
+    let initial_key = hmac::Key::new(hmac::HMAC_SHA256, &key_material);
+
+    // Rotate after every 2 connections, to a fresh random key each time.
+    let connections_per_rotation = std::num::NonZeroU64::new(2).unwrap();
+    let new_key: Arc<dyn Fn() -> Arc<dyn crypto::HmacKey> + Send + Sync> = Arc::new(|| {
+        let mut key_material = vec![0; 64];
+        rand::rng().fill_bytes(&mut key_material);
+        Arc::new(hmac::Key::new(hmac::HMAC_SHA256, &key_material)) as Arc<dyn crypto::HmacKey>
+    });
+
+    let mut endpoint_config = EndpointConfig::new(Arc::new(initial_key));
+    endpoint_config.rotate_reset_key_every(connections_per_rotation, new_key);
+    // Deterministic CID so a raw all-zero garbage datagram elicits a stateless reset addressed
+    // to the exact same connection ID both before and after rotation.
+    endpoint_config.cid_generator(Arc::new(move || {
+        Box::new(RandomConnectionIdGenerator::new(8))
+    }));
+    let endpoint_config = Arc::new(endpoint_config);
+    let mut endpoint = Endpoint::new(
+        endpoint_config.clone(),
+        Some(Arc::new(server_config())),
+        true,
+    );
+
+    let time = Instant::now();
+    let extract_token = |endpoint: &mut Endpoint, time: Instant, buf: &mut Vec<u8>| -> Vec<u8> {
+        buf.clear();
+        let event = endpoint.handle(time, remote, None, None, [0u8; 1024][..].into(), buf);
+        let Some(DatagramEvent::Response(transmit)) = event else {
+            panic!("expected a stateless reset response");
+        };
+        buf[transmit.size - RESET_TOKEN_SIZE..transmit.size].to_vec()
+    };
+
+    let mut buf = Vec::new();
+    let token_before_rotation = extract_token(&mut endpoint, time, &mut buf);
+
+    // Trigger rotation: connect and immediately drop enough connections to cross the threshold.
+    // `connect()` alone is enough to reach `note_new_connection` via `register_connection` --
+    // see `reset_key_rotation_covers_accept_path` below for the server-side (`accept()`) route,
+    // which is a separate call path and needs its own coverage.
+    for i in 0..connections_per_rotation.get() {
+        endpoint
+            .connect(
+                time + Duration::from_millis(1),
+                client_config(),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1000 + i as u16),
+                "localhost",
+            )
+            .unwrap();
+    }
+
+    // Past the rate limit window, so this counts as a fresh stateless reset opportunity.
+    let token_after_rotation = extract_token(
+        &mut endpoint,
+        time + endpoint_config.min_reset_interval,
+        &mut buf,
+    );
+
+    assert_ne!(
+        token_before_rotation, token_after_rotation,
+        "reset token for the same connection ID must change after reset_key rotation"
+    );
+}
+
+/// Without `rotate_reset_key_every`, the token for a given connection ID never changes — this
+/// pins today's default (no-rotation) behavior so a regression in the opt-in path can't silently
+/// change it.
+#[test]
+fn reset_key_without_rotation_stays_stable() {
+    let _guard = subscribe();
+    let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42);
+    let mut endpoint_config = EndpointConfig::default();
+    endpoint_config.cid_generator(Arc::new(move || {
+        Box::new(RandomConnectionIdGenerator::new(8))
+    }));
+    let endpoint_config = Arc::new(endpoint_config);
+    let mut endpoint = Endpoint::new(
+        endpoint_config.clone(),
+        Some(Arc::new(server_config())),
+        true,
+    );
+
+    let time = Instant::now();
+    let extract_token = |endpoint: &mut Endpoint, time: Instant, buf: &mut Vec<u8>| -> Vec<u8> {
+        buf.clear();
+        let event = endpoint.handle(time, remote, None, None, [0u8; 1024][..].into(), buf);
+        let Some(DatagramEvent::Response(transmit)) = event else {
+            panic!("expected a stateless reset response");
+        };
+        buf[transmit.size - RESET_TOKEN_SIZE..transmit.size].to_vec()
+    };
+
+    let mut buf = Vec::new();
+    let first = extract_token(&mut endpoint, time, &mut buf);
+    for i in 0..10 {
+        endpoint
+            .connect(
+                time + Duration::from_millis(1),
+                client_config(),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2000 + i as u16),
+                "localhost",
+            )
+            .unwrap();
+    }
+    let second = extract_token(
+        &mut endpoint,
+        time + endpoint_config.min_reset_interval,
+        &mut buf,
+    );
+    assert_eq!(first, second);
+}
+
+/// `note_new_connection` must fire for server-side connections too. `connect()` reaches it via
+/// `add_connection` -> `register_connection`, but `accept()` calls `register_connection`
+/// directly -- a prior refactor that split `accept()` off from `add_connection` broke this route
+/// silently, since nothing exercised a real accepted connection. Drive real handshakes through
+/// `Pair` (which exercises `Endpoint::accept`) and confirm the server's reset token still
+/// rotates.
+#[test]
+fn reset_key_rotation_covers_accept_path() {
+    let _guard = subscribe();
+
+    let mut key_material = vec![0; 64];
+    let mut rng = rand::rng();
+    rng.fill_bytes(&mut key_material);
+    let initial_key = hmac::Key::new(hmac::HMAC_SHA256, &key_material);
+
+    // Rotate after every connection, to a fresh random key each time.
+    let connections_per_rotation = std::num::NonZeroU64::new(1).unwrap();
+    let new_key: Arc<dyn Fn() -> Arc<dyn crypto::HmacKey> + Send + Sync> = Arc::new(|| {
+        let mut key_material = vec![0; 64];
+        rand::rng().fill_bytes(&mut key_material);
+        Arc::new(hmac::Key::new(hmac::HMAC_SHA256, &key_material)) as Arc<dyn crypto::HmacKey>
+    });
+
+    let mut endpoint_config = EndpointConfig::new(Arc::new(initial_key));
+    endpoint_config.rotate_reset_key_every(connections_per_rotation, new_key);
+    endpoint_config.cid_generator(Arc::new(move || {
+        Box::new(RandomConnectionIdGenerator::new(8))
+    }));
+    let endpoint_config = Arc::new(endpoint_config);
+
+    let mut pair = Pair::new(endpoint_config, server_config());
+
+    let extract_server_token = |pair: &mut Pair, buf: &mut Vec<u8>| -> Vec<u8> {
+        buf.clear();
+        let event = pair.server.handle(
+            pair.time,
+            pair.client.addr,
+            None,
+            None,
+            [0u8; 1024][..].into(),
+            buf,
+        );
+        let Some(DatagramEvent::Response(transmit)) = event else {
+            panic!("expected a stateless reset response");
+        };
+        buf[transmit.size - RESET_TOKEN_SIZE..transmit.size].to_vec()
+    };
+
+    let mut buf = Vec::new();
+    let token_before = extract_server_token(&mut pair, &mut buf);
+
+    // A single real handshake drives one `Endpoint::accept()` call on the server.
+    pair.connect();
+
+    let token_after = extract_server_token(&mut pair, &mut buf);
+
+    assert_ne!(
+        token_before, token_after,
+        "server's reset token must change after a real accepted connection crosses the \
+         rotation threshold -- if this fails, note_new_connection is no longer reachable \
+         from accept()"
+    );
+}
+
 #[test]
 fn export_keying_material() {
     let _guard = subscribe();
